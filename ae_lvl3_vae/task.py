@@ -1,28 +1,26 @@
 r"""
-Variational Autoencoder (VAE) with reparameterization trick on MNIST.
+Variational Autoencoder (VAE) — reparameterisation trick on MNIST
 
-Mathematical formulation:
-    ELBO (Evidence Lower Bound):
-        $\mathcal{L}(\theta, \phi; \mathbf{x}) =
-         \mathbb{E}_{q_\phi(\mathbf{z}|\mathbf{x})}[\log p_\theta(\mathbf{x}|\mathbf{z})]
-         - D_{KL}(q_\phi(\mathbf{z}|\mathbf{x}) \| p(\mathbf{z}))$
+Evidence Lower Bound (ELBO):
+    $\mathcal{L}(\theta,\phi;\mathbf{x})
+     = \mathbb{E}_{q_\phi(\mathbf{z}|\mathbf{x})}
+       [\log p_\theta(\mathbf{x}|\mathbf{z})]
+     - D_{KL}\bigl(q_\phi(\mathbf{z}|\mathbf{x})
+                    \| p(\mathbf{z})\bigr)$
 
-    Reparameterization trick:
-        $\mathbf{z} = \boldsymbol{\mu} + \boldsymbol{\sigma} \odot \boldsymbol{\epsilon},
-         \quad \boldsymbol{\epsilon} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$
+Reparameterisation:
+    $\mathbf{z} = \boldsymbol{\mu}
+     + \boldsymbol{\sigma}\odot\boldsymbol{\epsilon},
+     \quad \boldsymbol{\epsilon}\sim\mathcal{N}(0,I)$
 
-    KL divergence (closed form for diagonal Gaussian vs standard normal):
-        $D_{KL}(q \| p) = -\frac{1}{2} \sum_{j=1}^{J}
-         \left(1 + \log \sigma_j^2 - \mu_j^2 - \sigma_j^2\right)$
+KL divergence (diagonal Gaussian vs standard normal):
+    $D_{KL} = -\tfrac{1}{2}\sum_{j=1}^{J}
+     \bigl(1+\log\sigma_j^2-\mu_j^2-\sigma_j^2\bigr)$
 
-    Reconstruction loss: Binary Cross-Entropy per pixel.
-
-Trains on MNIST, generates samples, checks loss convergence.
+Reconstruction uses pixel-wise BCE (images kept in [0,1]).
 """
 
-import os
-import sys
-import json
+import os, sys, json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -33,475 +31,262 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+SEED = 42
+LATENT = 20
+HIDDEN = 400
+IMG_DIM = 784  # 28*28
+
+
+# ── model ─────────────────────────────────────────────────────────
+
+class VAE(nn.Module):
+    def __init__(self, img_dim=IMG_DIM, h=HIDDEN, z=LATENT):
+        super().__init__()
+        self.z_dim = z
+        self.enc = nn.Sequential(nn.Linear(img_dim, h), nn.ReLU(),
+                                 nn.Linear(h, h),       nn.ReLU())
+        self.to_mu     = nn.Linear(h, z)
+        self.to_logvar = nn.Linear(h, z)
+        self.dec = nn.Sequential(nn.Linear(z, h),       nn.ReLU(),
+                                 nn.Linear(h, h),       nn.ReLU(),
+                                 nn.Linear(h, img_dim), nn.Sigmoid())
+
+    def encode(self, x):
+        h = self.enc(x)
+        return self.to_mu(h), self.to_logvar(h)
+
+    def reparameterise(self, mu, lv):
+        return mu + torch.exp(0.5 * lv) * torch.randn_like(lv)
+
+    def decode(self, z):
+        return self.dec(z)
+
+    def forward(self, x):
+        mu, lv = self.encode(x)
+        z = self.reparameterise(mu, lv)
+        return self.decode(z), mu, lv
+
+
+def _elbo_loss(xr, x, mu, lv):
+    """Returns (total, recon, kl), each averaged over batch."""
+    bce = nn.functional.binary_cross_entropy(xr, x, reduction='sum')
+    kl  = -0.5 * torch.sum(1 + lv - mu.pow(2) - lv.exp())
+    bs  = x.size(0)
+    return (bce + kl) / bs, bce / bs, kl / bs
+
+
+# ── protocol functions ────────────────────────────────────────────
 
 def get_task_metadata():
-    """Return task metadata."""
     return {
-        'task_name': 'ae_lvl3_vae',
-        'task_type': 'generative',
-        'algorithm': 'Variational Autoencoder (VAE)',
+        'task_name':   'ae_lvl3_vae',
+        'task_type':   'generative',
+        'algorithm':   'Variational Autoencoder (VAE)',
         'input_shape': [1, 28, 28],
-        'latent_dim': 20,
-        'description': 'VAE with reparameterization trick, KL + reconstruction loss on MNIST'
+        'latent_dim':  LATENT,
+        'description': 'VAE with reparam trick, KL+BCE loss, trained on MNIST',
     }
 
 
-def set_seed(seed=42):
-    """Set random seeds for reproducibility."""
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+def set_seed(seed=SEED):
+    torch.manual_seed(seed); np.random.seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
 
 def get_device():
-    """Get the device for training."""
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-class VAE(nn.Module):
-    """Variational Autoencoder with MLP encoder and decoder."""
-
-    def __init__(self, input_dim=784, hidden_dim=400, latent_dim=20):
-        super().__init__()
-        self.latent_dim = latent_dim
-
-        # Encoder: x -> hidden -> (mu, log_var)
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
-        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
-        self.fc_log_var = nn.Linear(hidden_dim, latent_dim)
-
-        # Decoder: z -> hidden -> x_recon
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim),
-            nn.Sigmoid()
-        )
-
-    def encode(self, x):
-        """Encode input to latent distribution parameters."""
-        h = self.encoder(x)
-        mu = self.fc_mu(h)
-        log_var = self.fc_log_var(h)
-        return mu, log_var
-
-    def reparameterize(self, mu, log_var):
-        """Reparameterization trick: z = mu + std * eps."""
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
-        return mu + std * eps
-
-    def decode(self, z):
-        """Decode latent vector to reconstruction."""
-        return self.decoder(z)
-
-    def forward(self, x):
-        mu, log_var = self.encode(x)
-        z = self.reparameterize(mu, log_var)
-        x_recon = self.decode(z)
-        return x_recon, mu, log_var
-
-
-def vae_loss(x_recon, x, mu, log_var):
-    """
-    Compute VAE loss = Reconstruction + KL divergence.
-    Reconstruction: BCE summed over pixels, averaged over batch.
-    KL: -0.5 * sum(1 + log_var - mu^2 - exp(log_var)), averaged over batch.
-    """
-    bce = nn.functional.binary_cross_entropy(x_recon, x, reduction='sum')
-    kl = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
-    batch_size = x.size(0)
-    return (bce + kl) / batch_size, bce / batch_size, kl / batch_size
-
-
 def make_dataloaders(batch_size=128, val_ratio=0.15, num_workers=2):
-    """Create MNIST data loaders for VAE training."""
-    transform = transforms.Compose([
-        transforms.ToTensor()  # No normalization -- keep [0,1] for BCE
-    ])
-
-    full_train = datasets.MNIST(
-        root='./data', train=True, download=True, transform=transform
-    )
-
-    val_size = int(len(full_train) * val_ratio)
-    train_size = len(full_train) - val_size
-
-    train_dataset, val_dataset = random_split(
-        full_train, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
-    )
-
-    return train_loader, val_loader
+    """MNIST loaders; images stay in [0,1] (no normalisation) for BCE."""
+    tfm = transforms.ToTensor()
+    full = datasets.MNIST('./data', train=True, download=True, transform=tfm)
+    nv = int(len(full) * val_ratio)
+    tr, va = random_split(full, [len(full) - nv, nv],
+                          generator=torch.Generator().manual_seed(SEED))
+    kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    return DataLoader(tr, shuffle=True, **kw), DataLoader(va, shuffle=False, **kw)
 
 
-def build_model(input_dim=784, hidden_dim=400, latent_dim=20):
-    """Build the VAE model."""
-    device = get_device()
-    model = VAE(input_dim=input_dim, hidden_dim=hidden_dim,
-                latent_dim=latent_dim).to(device)
-    return model
+def build_model(input_dim=IMG_DIM, hidden_dim=HIDDEN, latent_dim=LATENT):
+    return VAE(input_dim, hidden_dim, latent_dim).to(get_device())
 
 
-def train(model, train_loader, val_loader, epochs=15, lr=1e-3):
-    """Train the VAE."""
-    device = get_device()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+def train(model, tr_dl, va_dl, epochs=15, lr=1e-3):
+    dev = get_device()
+    opt = optim.Adam(model.parameters(), lr=lr)
+    h_loss, h_val, h_rec, h_kl = [], [], [], []
 
-    train_losses = []
-    val_losses = []
-    train_kls = []
-    train_recons = []
-
-    for epoch in range(epochs):
+    for ep in range(epochs):
         model.train()
-        epoch_loss = 0.0
-        epoch_recon = 0.0
-        epoch_kl = 0.0
+        s_l = s_r = s_k = 0.0
+        for imgs, _ in tr_dl:
+            x = imgs.to(dev).view(imgs.size(0), -1)
+            opt.zero_grad()
+            xr, mu, lv = model(x)
+            loss, rec, kl = _elbo_loss(xr, x, mu, lv)
+            loss.backward(); opt.step()
+            s_l += loss.item(); s_r += rec.item(); s_k += kl.item()
 
-        for data, _ in train_loader:
-            data = data.to(device).view(data.size(0), -1)
+        nb = len(tr_dl)
+        h_loss.append(s_l / nb); h_rec.append(s_r / nb); h_kl.append(s_k / nb)
+        vm = evaluate(model, va_dl, grab_samples=False)
+        h_val.append(vm['loss'])
 
-            optimizer.zero_grad()
-            x_recon, mu, log_var = model(data)
-            loss, recon, kl = vae_loss(x_recon, data, mu, log_var)
-            loss.backward()
-            optimizer.step()
+        print(f"  ep {ep+1:>2d}/{epochs}  "
+              f"loss={s_l/nb:.1f}  rec={s_r/nb:.1f}  kl={s_k/nb:.1f}  "
+              f"val={vm['loss']:.1f}")
 
-            epoch_loss += loss.item()
-            epoch_recon += recon.item()
-            epoch_kl += kl.item()
-
-        n_batches = len(train_loader)
-        avg_loss = epoch_loss / n_batches
-        avg_recon = epoch_recon / n_batches
-        avg_kl = epoch_kl / n_batches
-
-        train_losses.append(avg_loss)
-        train_recons.append(avg_recon)
-        train_kls.append(avg_kl)
-
-        # Validation
-        val_metrics = evaluate(model, val_loader, return_samples=False)
-        val_losses.append(val_metrics['loss'])
-
-        print(f"Epoch [{epoch+1}/{epochs}], "
-              f"Loss: {avg_loss:.2f}, "
-              f"Recon: {avg_recon:.2f}, "
-              f"KL: {avg_kl:.2f}, "
-              f"Val Loss: {val_metrics['loss']:.2f}")
-
-    return {
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'train_recons': train_recons,
-        'train_kls': train_kls
-    }
+    return dict(train_losses=h_loss, val_losses=h_val,
+                train_recons=h_rec, train_kls=h_kl)
 
 
-def evaluate(model, data_loader, return_samples=True):
-    """Evaluate VAE on a data split. Returns loss metrics and optional samples."""
-    device = get_device()
-    model.eval()
-
-    total_loss = 0.0
-    total_recon = 0.0
-    total_kl = 0.0
-    sample_originals = None
-    sample_recons = None
-
+def evaluate(model, dl, grab_samples=True):
+    dev = get_device(); model.eval()
+    s_l = s_r = s_k = 0.0
+    orig = recon = None
     with torch.no_grad():
-        for i, (data, _) in enumerate(data_loader):
-            data = data.to(device).view(data.size(0), -1)
-            x_recon, mu, log_var = model(data)
-            loss, recon, kl = vae_loss(x_recon, data, mu, log_var)
-
-            total_loss += loss.item()
-            total_recon += recon.item()
-            total_kl += kl.item()
-
-            # Capture first batch for visualization
-            if return_samples and i == 0:
-                sample_originals = data[:8].cpu()
-                sample_recons = x_recon[:8].cpu()
-
-    n_batches = len(data_loader)
-    metrics = {
-        'loss': total_loss / n_batches,
-        'recon_loss': total_recon / n_batches,
-        'kl_loss': total_kl / n_batches
-    }
-
-    if return_samples:
-        metrics['sample_originals'] = sample_originals
-        metrics['sample_recons'] = sample_recons
-
-    return metrics
+        for i, (imgs, _) in enumerate(dl):
+            x = imgs.to(dev).view(imgs.size(0), -1)
+            xr, mu, lv = model(x)
+            l, r, k = _elbo_loss(xr, x, mu, lv)
+            s_l += l.item(); s_r += r.item(); s_k += k.item()
+            if grab_samples and i == 0:
+                orig, recon = x[:8].cpu(), xr[:8].cpu()
+    nb = len(dl)
+    out = dict(loss=s_l/nb, recon_loss=s_r/nb, kl_loss=s_k/nb)
+    if grab_samples:
+        out['sample_originals'] = orig; out['sample_recons'] = recon
+    return out
 
 
-def predict(model, data_loader):
-    """Encode data and return latent representations."""
-    device = get_device()
-    model.eval()
-    all_mu = []
-    all_z = []
-
+def predict(model, dl):
+    dev = get_device(); model.eval()
+    mus, zs = [], []
     with torch.no_grad():
-        for data, _ in data_loader:
-            data = data.to(device).view(data.size(0), -1)
-            mu, log_var = model.encode(data)
-            z = model.reparameterize(mu, log_var)
-            all_mu.extend(mu.cpu().numpy())
-            all_z.extend(z.cpu().numpy())
-
-    return np.array(all_mu), np.array(all_z)
+        for imgs, _ in dl:
+            x = imgs.to(dev).view(imgs.size(0), -1)
+            mu, lv = model.encode(x)
+            mus.append(mu.cpu()); zs.append(model.reparameterise(mu, lv).cpu())
+    return torch.cat(mus).numpy(), torch.cat(zs).numpy()
 
 
-def _generate_samples(model, n_samples=64):
-    """Generate new samples by decoding random latent vectors."""
-    device = get_device()
+def _sample(model, n=64):
     model.eval()
-
     with torch.no_grad():
-        z = torch.randn(n_samples, model.latent_dim, device=device)
-        samples = model.decode(z).cpu()
-
-    return samples
+        z = torch.randn(n, model.z_dim, device=next(model.parameters()).device)
+        return model.decode(z).cpu()
 
 
 def save_artifacts(model, metrics, output_dir='./output'):
-    """Save model, metrics, reconstruction grid, and generated samples."""
     os.makedirs(output_dir, exist_ok=True)
-
-    # Save model
     torch.save(model.state_dict(), os.path.join(output_dir, 'model.pth'))
 
-    # Save serializable metrics
-    serializable = {}
-    for k, v in metrics.items():
-        if isinstance(v, (list, float, int, str, bool)):
-            serializable[k] = v
-        elif isinstance(v, dict):
-            serializable[k] = {
-                sk: sv if isinstance(sv, (float, int, str, bool, list)) else str(sv)
-                for sk, sv in v.items()
-            }
-
+    safe = {k: v for k, v in metrics.items()
+            if isinstance(v, (float, int, str, bool, list, dict))}
     with open(os.path.join(output_dir, 'metrics.json'), 'w') as f:
-        json.dump(serializable, f, indent=2)
+        json.dump(safe, f, indent=2)
 
-    # Save reconstruction comparison
-    if 'sample_originals' in metrics and metrics['sample_originals'] is not None:
-        originals = metrics['sample_originals']
-        recons = metrics['sample_recons']
-        n = originals.size(0)
-
-        fig, axes = plt.subplots(2, n, figsize=(n * 2, 4))
+    # reconstruction grid
+    if metrics.get('sample_originals') is not None:
+        o, r = metrics['sample_originals'], metrics['sample_recons']
+        n = o.size(0)
+        fig, ax = plt.subplots(2, n, figsize=(n * 1.8, 3.6))
         for i in range(n):
-            axes[0, i].imshow(originals[i].view(28, 28).numpy(), cmap='gray')
-            axes[0, i].axis('off')
-            if i == 0:
-                axes[0, i].set_title('Original', fontsize=10)
-
-            axes[1, i].imshow(recons[i].view(28, 28).numpy(), cmap='gray')
-            axes[1, i].axis('off')
-            if i == 0:
-                axes[1, i].set_title('Recon', fontsize=10)
-
-        plt.suptitle('VAE Reconstructions')
+            ax[0, i].imshow(o[i].view(28, 28), cmap='gray'); ax[0, i].axis('off')
+            ax[1, i].imshow(r[i].view(28, 28), cmap='gray'); ax[1, i].axis('off')
+        ax[0, 0].set_title('input', fontsize=9)
+        ax[1, 0].set_title('recon', fontsize=9)
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'vae_reconstructions.png'),
-                    dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(output_dir, 'vae_reconstructions.png'), dpi=120)
         plt.close()
 
-    # Save generated samples grid
-    samples = _generate_samples(model, n_samples=64)
-    fig, axes = plt.subplots(8, 8, figsize=(10, 10))
+    # generated grid
+    samp = _sample(model, 64)
+    fig, ax = plt.subplots(8, 8, figsize=(8, 8))
     for i in range(64):
-        ax = axes[i // 8, i % 8]
-        ax.imshow(samples[i].view(28, 28).numpy(), cmap='gray')
-        ax.axis('off')
-    plt.suptitle('VAE Generated Samples')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'vae_generated_samples.png'),
-                dpi=150, bbox_inches='tight')
+        ax[i // 8, i % 8].imshow(samp[i].view(28, 28), cmap='gray')
+        ax[i // 8, i % 8].axis('off')
+    plt.suptitle('Generated digits'); plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'vae_generated_samples.png'), dpi=120)
     plt.close()
 
-    # Loss curves
+    # loss curves
     if 'history' in metrics:
         h = metrics['history']
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-        ax1.plot(h['train_losses'], label='Train ELBO')
-        ax1.plot(h['val_losses'], label='Val ELBO')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.set_title('Total Loss (ELBO)')
-        ax1.legend()
-
-        ax2.plot(h['train_recons'], label='Recon Loss')
-        ax2.plot(h['train_kls'], label='KL Loss')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Loss')
-        ax2.set_title('Loss Components')
-        ax2.legend()
-
+        fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 4))
+        a1.plot(h['train_losses'], label='train'); a1.plot(h['val_losses'], label='val')
+        a1.set(xlabel='epoch', ylabel='ELBO', title='Total loss'); a1.legend()
+        a2.plot(h['train_recons'], label='recon'); a2.plot(h['train_kls'], label='KL')
+        a2.set(xlabel='epoch', ylabel='loss', title='Components'); a2.legend()
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'vae_loss_curves.png'),
-                    dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(output_dir, 'vae_loss_curves.png'), dpi=120)
         plt.close()
 
-    print(f"Artifacts saved to {output_dir}")
+    print(f"[save_artifacts] wrote to {output_dir}/")
 
+
+# ── main ──────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("Variational Autoencoder (VAE) on MNIST")
-    print("=" * 60)
+    print("=" * 55)
+    print(" VAE  |  MNIST, reparam trick, ELBO objective")
+    print("=" * 55)
+    set_seed()
+    meta = get_task_metadata()
+    print(f"task: {meta['task_name']}   z_dim={LATENT}\n")
 
-    set_seed(42)
-    metadata = get_task_metadata()
-    print(f"\nTask: {metadata['task_name']}")
-    print(f"Algorithm: {metadata['algorithm']}")
-    print(f"Latent dim: {metadata['latent_dim']}")
+    tr_dl, va_dl = make_dataloaders(batch_size=128)
+    print(f"data : {len(tr_dl.dataset)} train / {len(va_dl.dataset)} val")
 
-    # Data
-    print("\nLoading MNIST...")
-    train_loader, val_loader = make_dataloaders(batch_size=128)
-    print(f"Train samples: {len(train_loader.dataset)}")
-    print(f"Val samples: {len(val_loader.dataset)}")
+    model = build_model()
+    n_par = sum(p.numel() for p in model.parameters())
+    print(f"params: {n_par:,}\n")
 
-    # Model
-    model = build_model(input_dim=784, hidden_dim=400, latent_dim=20)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"\nModel parameters: {total_params:,}")
-    print(f"Architecture:\n{model}")
+    hist = train(model, tr_dl, va_dl, epochs=15, lr=1e-3)
 
-    # Train
-    print("\n" + "-" * 60)
-    history = train(model, train_loader, val_loader, epochs=15, lr=1e-3)
+    tr_m = evaluate(model, tr_dl)
+    va_m = evaluate(model, va_dl)
+    print(f"\n  train  loss={tr_m['loss']:.1f}  rec={tr_m['recon_loss']:.1f}  kl={tr_m['kl_loss']:.1f}")
+    print(f"  val    loss={va_m['loss']:.1f}  rec={va_m['recon_loss']:.1f}  kl={va_m['kl_loss']:.1f}")
 
-    # Evaluate on both splits
-    print("\n" + "-" * 60)
-    print("Evaluating on training set...")
-    train_metrics = evaluate(model, train_loader)
-    print(f"Train Loss: {train_metrics['loss']:.2f}, "
-          f"Recon: {train_metrics['recon_loss']:.2f}, "
-          f"KL: {train_metrics['kl_loss']:.2f}")
-
-    print("\nEvaluating on validation set...")
-    val_metrics = evaluate(model, val_loader)
-    print(f"Val Loss: {val_metrics['loss']:.2f}, "
-          f"Recon: {val_metrics['recon_loss']:.2f}, "
-          f"KL: {val_metrics['kl_loss']:.2f}")
-
-    # Generate samples
-    print("\nGenerating samples...")
-    samples = _generate_samples(model, n_samples=16)
-    has_nan = torch.isnan(samples).any().item()
-    print(f"Generated 16 samples, NaN check: {'FAIL - NaNs found' if has_nan else 'OK'}")
-
-    # Check for posterior collapse (KL too small)
-    kl_value = val_metrics['kl_loss']
-    posterior_collapse = kl_value < 0.1
-    if posterior_collapse:
-        print(f"WARNING: Possible posterior collapse (KL = {kl_value:.4f})")
+    samp = _sample(model, 16)
+    has_nan = torch.isnan(samp).any().item()
+    kl_val = va_m['kl_loss']
+    collapse = kl_val < 0.1
+    if collapse:
+        print(f"  WARNING: possible posterior collapse (KL={kl_val:.3f})")
     else:
-        print(f"KL divergence healthy: {kl_value:.2f}")
+        print(f"  KL healthy: {kl_val:.1f}")
 
-    # Save artifacts
-    print("\nSaving artifacts...")
-    all_metrics = {
-        'train_loss': train_metrics['loss'],
-        'train_recon': train_metrics['recon_loss'],
-        'train_kl': train_metrics['kl_loss'],
-        'val_loss': val_metrics['loss'],
-        'val_recon': val_metrics['recon_loss'],
-        'val_kl': val_metrics['kl_loss'],
-        'sample_originals': val_metrics.get('sample_originals'),
-        'sample_recons': val_metrics.get('sample_recons'),
-        'history': {
-            'train_losses': history['train_losses'],
-            'val_losses': history['val_losses'],
-            'train_recons': history['train_recons'],
-            'train_kls': history['train_kls']
-        }
-    }
-    save_artifacts(model, all_metrics)
+    save_artifacts(model, {
+        **{f'{split}_{k}': va_m[k] if split == 'val' else tr_m[k]
+           for split in ('train', 'val') for k in ('loss', 'recon_loss', 'kl_loss')},
+        'sample_originals': va_m.get('sample_originals'),
+        'sample_recons':    va_m.get('sample_recons'),
+        'history': dict(train_losses=hist['train_losses'],
+                        val_losses=hist['val_losses'],
+                        train_recons=hist['train_recons'],
+                        train_kls=hist['train_kls']),
+    })
 
-    # Final results
-    print("\n" + "=" * 60)
-    print("FINAL RESULTS")
-    print("=" * 60)
-    print(f"Train Total Loss:  {train_metrics['loss']:.2f}")
-    print(f"Train Recon Loss:  {train_metrics['recon_loss']:.2f}")
-    print(f"Train KL Loss:     {train_metrics['kl_loss']:.2f}")
-    print(f"Val Total Loss:    {val_metrics['loss']:.2f}")
-    print(f"Val Recon Loss:    {val_metrics['recon_loss']:.2f}")
-    print(f"Val KL Loss:       {val_metrics['kl_loss']:.2f}")
+    print(f"\n{'='*55}")
+    print(" QUALITY CHECKS")
+    print(f"{'='*55}")
+    ok = True
+    for tag, cond in [
+        (f"loss decreased  ({hist['train_losses'][0]:.0f} -> {hist['train_losses'][-1]:.0f})",
+         hist['train_losses'][-1] < hist['train_losses'][0]),
+        ("no NaN in samples",        not has_nan),
+        (f"no posterior collapse (KL={kl_val:.1f})",  not collapse),
+        (f"val/train ratio < 1.3  ({va_m['loss']/tr_m['loss']:.3f})",
+         va_m['loss'] / tr_m['loss'] < 1.3 if tr_m['loss'] > 0 else False),
+        (f"val recon < 100        ({va_m['recon_loss']:.1f})",
+         va_m['recon_loss'] < 100),
+    ]:
+        print(f"  [{'PASS' if cond else 'FAIL'}] {tag}")
+        ok = ok and cond
 
-    # Quality checks
-    print("\n" + "=" * 60)
-    print("QUALITY CHECKS")
-    print("=" * 60)
-
-    checks_passed = True
-
-    # Check 1: Loss decreased during training
-    loss_decreased = history['train_losses'][-1] < history['train_losses'][0]
-    s1 = "PASS" if loss_decreased else "FAIL"
-    print(f"[{s1}] Loss decreased: "
-          f"{history['train_losses'][0]:.2f} -> {history['train_losses'][-1]:.2f}")
-    checks_passed = checks_passed and loss_decreased
-
-    # Check 2: No NaN in generated samples
-    no_nan = not has_nan
-    s2 = "PASS" if no_nan else "FAIL"
-    print(f"[{s2}] No NaN in generated samples")
-    checks_passed = checks_passed and no_nan
-
-    # Check 3: No posterior collapse (KL > 0.1)
-    no_collapse = not posterior_collapse
-    s3 = "PASS" if no_collapse else "FAIL"
-    print(f"[{s3}] No posterior collapse (KL = {kl_value:.2f} > 0.1)")
-    checks_passed = checks_passed and no_collapse
-
-    # Check 4: Val loss within reasonable range of train loss
-    loss_ratio = val_metrics['loss'] / train_metrics['loss'] if train_metrics['loss'] > 0 else 999
-    reasonable_gap = loss_ratio < 1.3
-    s4 = "PASS" if reasonable_gap else "FAIL"
-    print(f"[{s4}] Val/Train loss ratio < 1.3: {loss_ratio:.4f}")
-    checks_passed = checks_passed and reasonable_gap
-
-    # Check 5: Reconstruction loss is reasonable (below 100 per sample for MNIST)
-    recon_ok = val_metrics['recon_loss'] < 100
-    s5 = "PASS" if recon_ok else "FAIL"
-    print(f"[{s5}] Val recon loss < 100: {val_metrics['recon_loss']:.2f}")
-    checks_passed = checks_passed and recon_ok
-
-    print("\n" + "=" * 60)
-    if checks_passed:
-        print("PASS: All quality checks passed!")
-    else:
-        print("FAIL: Some quality checks failed!")
-    print("=" * 60)
-
-    sys.exit(0 if checks_passed else 1)
+    print(f"\n{'PASS' if ok else 'FAIL'}: all quality checks {'passed' if ok else 'did not pass'}")
+    sys.exit(0 if ok else 1)

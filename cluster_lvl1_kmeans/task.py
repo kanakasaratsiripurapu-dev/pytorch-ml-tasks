@@ -1,399 +1,239 @@
 """
-K-Means Clustering from scratch using PyTorch tensors.
+K-Means Clustering — from-scratch PyTorch implementation
 
-Mathematical formulation:
-    Objective (within-cluster SSE):
-        J = sum_{k=1}^{K} sum_{x_i in C_k} || x_i - mu_k ||^2
+Objective (within-cluster sum of squared errors):
+    J = sum_{k=1}^{K} sum_{x_i in C_k} || x_i - mu_k ||^2
 
-    Algorithm:
-        1. Initialize centroids via k-means++ (greedy distance-based selection)
-        2. Assign each point to nearest centroid (vectorized L2 distance)
-        3. Recompute centroids as cluster means
-        4. Repeat until convergence or max iterations
+Steps:
+    1. Initialise centroids using k-means++ (distance-proportional sampling)
+    2. Assign every point to its closest centroid (vectorised L2 via torch.cdist)
+    3. Recompute each centroid as the mean of its assigned points
+    4. Repeat until centroid shift < tolerance or max iterations
 
-Validates against sklearn KMeans (inertia within 5%).
+Validates against sklearn.cluster.KMeans; our inertia should be within 5 %.
 """
 
-import os
-import sys
-import json
+import os, sys, json
 import numpy as np
 import torch
 from sklearn.datasets import make_blobs
-from sklearn.cluster import KMeans as SklearnKMeans
+from sklearn.cluster import KMeans as SkKMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import adjusted_rand_score
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+SEED = 42
+K = 4
+
+
+# ── helpers (private) ─────────────────────────────────────────────
+
+def _kpp_init(X, k):
+    """k-means++ centroid seeding."""
+    n = X.shape[0]
+    centres = [X[torch.randint(0, n, (1,), device=X.device).item()]]
+    for _ in range(1, k):
+        stk = torch.stack(centres)
+        d2 = torch.cdist(X.unsqueeze(0), stk.unsqueeze(0)).squeeze(0).min(1).values ** 2
+        idx = torch.multinomial(d2 / d2.sum(), 1).item()
+        centres.append(X[idx])
+    return torch.stack(centres)
+
+
+def _labels(X, C):
+    return torch.cdist(X, C).argmin(1)
+
+
+def _inertia(X, C, lab):
+    return ((X - C[lab]) ** 2).sum().item()
+
+
+# ── protocol functions ────────────────────────────────────────────
 
 def get_task_metadata():
-    """Return task metadata."""
     return {
-        'task_name': 'cluster_lvl1_kmeans',
-        'task_type': 'clustering',
-        'algorithm': 'K-Means (From Scratch)',
-        'k': 4,
-        'description': 'K-Means with k-means++ init and vectorized updates, compared to sklearn'
+        'task_name':   'cluster_lvl1_kmeans',
+        'task_type':   'clustering',
+        'algorithm':   'K-Means (From Scratch)',
+        'k': K,
+        'description': 'K-Means with k-means++ init and vectorised updates',
     }
 
 
-def set_seed(seed=42):
-    """Set random seeds for reproducibility."""
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+def set_seed(seed=SEED):
+    torch.manual_seed(seed); np.random.seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
 
 def get_device():
-    """Get the device for computation."""
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def _kmeans_plus_plus_init(X, k):
-    """
-    K-means++ initialization: pick first centroid randomly,
-    then each subsequent centroid with probability proportional to D(x)^2.
-    """
-    n = X.shape[0]
-    device = X.device
+def make_dataloaders(n_samples=800, n_features=2, k=K, val_ratio=0.2):
+    """Synthetic blobs, standardised, split 80/20."""
+    set_seed()
+    X, y = make_blobs(n_samples=n_samples, centers=k,
+                      n_features=n_features, cluster_std=1.0, random_state=SEED)
+    sc = StandardScaler()
+    Xs = sc.fit_transform(X)
 
-    # First centroid: random
-    idx = torch.randint(0, n, (1,), device=device).item()
-    centroids = [X[idx]]
+    perm = np.random.permutation(n_samples)
+    cut = int(n_samples * val_ratio)
+    tr_i, va_i = perm[cut:], perm[:cut]
 
-    for _ in range(1, k):
-        # Compute distance from each point to nearest existing centroid
-        stacked = torch.stack(centroids, dim=0)  # [c, d]
-        dists = torch.cdist(X.unsqueeze(0), stacked.unsqueeze(0)).squeeze(0)  # [n, c]
-        min_dists, _ = dists.min(dim=1)  # [n]
-        min_dists_sq = min_dists ** 2
-
-        # Sample proportional to D^2
-        probs = min_dists_sq / min_dists_sq.sum()
-        idx = torch.multinomial(probs, 1).item()
-        centroids.append(X[idx])
-
-    return torch.stack(centroids, dim=0)  # [k, d]
+    dev = get_device()
+    Xtr = torch.FloatTensor(Xs[tr_i]).to(dev)
+    Xva = torch.FloatTensor(Xs[va_i]).to(dev)
+    return Xtr, Xva, y[tr_i], y[va_i], Xs, y
 
 
-def _compute_distances(X, centroids):
-    """Compute pairwise L2 distances between X [n, d] and centroids [k, d]."""
-    return torch.cdist(X, centroids)  # [n, k]
-
-
-def _assign_clusters(X, centroids):
-    """Assign each point to the nearest centroid. Returns labels [n]."""
-    dists = _compute_distances(X, centroids)
-    return torch.argmin(dists, dim=1)
-
-
-def _compute_inertia(X, centroids, labels):
-    """Compute within-cluster SSE (inertia)."""
-    assigned_centroids = centroids[labels]  # [n, d]
-    return ((X - assigned_centroids) ** 2).sum().item()
-
-
-def make_dataloaders(n_samples=800, n_features=2, k=4, val_ratio=0.2):
-    """
-    Generate synthetic blob data for clustering.
-    Split into 80% train / 20% validation.
-    Returns train/val tensors, ground-truth labels, and raw numpy arrays.
-    """
-    set_seed(42)
-
-    X, y_true = make_blobs(
-        n_samples=n_samples, centers=k, n_features=n_features,
-        cluster_std=1.0, random_state=42
-    )
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # Split into train/val
-    indices = np.random.permutation(n_samples)
-    val_size = int(n_samples * val_ratio)
-    train_idx = indices[val_size:]
-    val_idx = indices[:val_size]
-
-    device = get_device()
-    X_train = torch.FloatTensor(X_scaled[train_idx]).to(device)
-    X_val = torch.FloatTensor(X_scaled[val_idx]).to(device)
-    y_train = y_true[train_idx]
-    y_val = y_true[val_idx]
-
-    return X_train, X_val, y_train, y_val, X_scaled, y_true
-
-
-def build_model(X, k=4):
-    """Initialize centroids using k-means++."""
-    centroids = _kmeans_plus_plus_init(X, k)
-    return {'centroids': centroids, 'k': k}
+def build_model(X, k=K):
+    return {'centroids': _kpp_init(X, k), 'k': k}
 
 
 def train(model, X, max_iters=100, tol=1e-6):
-    """
-    Run K-Means iterations until convergence.
-    Returns training history with inertia per iteration.
-    """
-    centroids = model['centroids'].clone()
+    """Lloyd's algorithm until convergence."""
+    C = model['centroids'].clone()
     k = model['k']
-    inertia_history = []
+    inertia_log = []
 
-    for iteration in range(max_iters):
-        # Step 1: Assign clusters
-        labels = _assign_clusters(X, centroids)
-
-        # Step 2: Compute new centroids
-        new_centroids = torch.zeros_like(centroids)
+    for it in range(max_iters):
+        lab = _labels(X, C)
+        C_new = torch.zeros_like(C)
         for j in range(k):
-            mask = (labels == j)
-            if mask.sum() > 0:
-                new_centroids[j] = X[mask].mean(dim=0)
-            else:
-                # Reinitialize empty cluster to a random point
-                new_centroids[j] = X[torch.randint(0, X.shape[0], (1,))].squeeze()
+            mask = lab == j
+            C_new[j] = X[mask].mean(0) if mask.any() else X[torch.randint(0, len(X), (1,))]
+        sse = _inertia(X, C_new, lab)
+        inertia_log.append(sse)
+        shift = ((C_new - C) ** 2).sum().item()
+        C = C_new
 
-        # Compute inertia
-        inertia = _compute_inertia(X, new_centroids, labels)
-        inertia_history.append(inertia)
-
-        # Check convergence
-        shift = ((new_centroids - centroids) ** 2).sum().item()
-        centroids = new_centroids
-
-        if (iteration + 1) % 10 == 0 or shift < tol:
-            print(f"Iter [{iteration+1}/{max_iters}], "
-                  f"Inertia: {inertia:.4f}, Shift: {shift:.6f}")
-
+        if (it + 1) % 10 == 0 or shift < tol:
+            print(f"  iter {it+1:>3d}  inertia={sse:.2f}  shift={shift:.1e}")
         if shift < tol:
-            print(f"Converged at iteration {iteration+1}")
+            print(f"  converged at iteration {it+1}")
             break
 
-    model['centroids'] = centroids
-
-    return {
-        'inertia_history': inertia_history,
-        'n_iterations': iteration + 1,
-        'final_inertia': inertia_history[-1]
-    }
+    model['centroids'] = C
+    return dict(inertia_history=inertia_log, n_iterations=it + 1,
+                final_inertia=inertia_log[-1])
 
 
 def evaluate(model, X, y_true=None):
-    """Evaluate clustering: inertia and optionally ARI against ground truth."""
-    centroids = model['centroids']
-    labels = _assign_clusters(X, centroids)
-    inertia = _compute_inertia(X, centroids, labels)
-
-    metrics = {
-        'inertia': inertia,
-        'labels': labels.cpu().numpy()
-    }
-
+    C = model['centroids']
+    lab = _labels(X, C)
+    out = dict(inertia=_inertia(X, C, lab), labels=lab.cpu().numpy())
     if y_true is not None:
-        ari = adjusted_rand_score(y_true, labels.cpu().numpy())
-        metrics['adjusted_rand_index'] = ari
-
-    return metrics
+        out['adjusted_rand_index'] = adjusted_rand_score(y_true, lab.cpu().numpy())
+    return out
 
 
 def predict(model, X):
-    """Predict cluster assignments for new data."""
-    centroids = model['centroids']
-    labels = _assign_clusters(X, centroids)
-    dists = _compute_distances(X, centroids)
-    return labels.cpu().numpy(), dists.cpu().numpy()
+    C = model['centroids']
+    lab = _labels(X, C)
+    return lab.cpu().numpy(), torch.cdist(X, C).cpu().numpy()
 
 
 def save_artifacts(model, metrics, output_dir='./output'):
-    """Save centroids, metrics, and cluster visualization."""
     os.makedirs(output_dir, exist_ok=True)
+    torch.save(model['centroids'].cpu(), os.path.join(output_dir, 'centroids.pth'))
 
-    # Save centroids
-    torch.save(model['centroids'].cpu(),
-               os.path.join(output_dir, 'centroids.pth'))
-
-    # Save serializable metrics
-    serializable = {}
+    safe = {}
     for k, v in metrics.items():
-        if isinstance(v, np.ndarray):
-            serializable[k] = v.tolist()
-        elif isinstance(v, (list, float, int, str, bool)):
-            serializable[k] = v
+        if isinstance(v, np.ndarray):    safe[k] = v.tolist()
+        elif isinstance(v, (list, float, int, str, bool)): safe[k] = v
         elif isinstance(v, dict):
-            serializable[k] = {
-                sk: sv.tolist() if isinstance(sv, np.ndarray) else sv
-                for sk, sv in v.items()
-            }
-
+            safe[k] = {sk: (sv.tolist() if isinstance(sv, np.ndarray) else sv)
+                       for sk, sv in v.items()}
     with open(os.path.join(output_dir, 'metrics.json'), 'w') as f:
-        json.dump(serializable, f, indent=2)
+        json.dump(safe, f, indent=2)
 
-    # Inertia convergence plot
+    # convergence plot
     if 'inertia_history' in metrics:
-        plt.figure(figsize=(8, 5))
-        plt.plot(metrics['inertia_history'], marker='o', markersize=3)
-        plt.xlabel('Iteration')
-        plt.ylabel('Inertia (SSE)')
-        plt.title('K-Means Inertia Convergence')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'kmeans_inertia.png'),
-                    dpi=150, bbox_inches='tight')
+        plt.figure(figsize=(7, 4))
+        plt.plot(metrics['inertia_history'], 'o-', markersize=3)
+        plt.xlabel('Iteration'); plt.ylabel('Inertia (SSE)')
+        plt.title('K-Means convergence'); plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'kmeans_inertia.png'), dpi=120)
         plt.close()
 
-    # Cluster scatter plot (2D only)
+    # scatter (2-D only)
     if 'X_2d' in metrics:
-        X_2d = metrics['X_2d']
-        centroids = model['centroids'].cpu().numpy()
-        # Assign all points to nearest centroid for plotting
-        X_full = torch.FloatTensor(X_2d).to(model['centroids'].device)
-        labels = _assign_clusters(X_full, model['centroids']).cpu().numpy()
-
-        plt.figure(figsize=(10, 8))
-        scatter = plt.scatter(X_2d[:, 0], X_2d[:, 1], c=labels,
-                              cmap='viridis', s=20, alpha=0.6)
-        plt.scatter(centroids[:, 0], centroids[:, 1],
-                    c='red', marker='X', s=200, edgecolors='black',
-                    linewidths=2, label='Centroids')
-        plt.colorbar(scatter, label='Cluster')
-        plt.legend()
-        plt.title('K-Means Clustering Result')
-        plt.xlabel('Feature 1')
-        plt.ylabel('Feature 2')
+        Xp = metrics['X_2d']
+        Cf = model['centroids'].cpu().numpy()
+        dev = model['centroids'].device
+        full_lab = _labels(torch.FloatTensor(Xp).to(dev),
+                           model['centroids']).cpu().numpy()
+        plt.figure(figsize=(8, 6))
+        plt.scatter(Xp[:, 0], Xp[:, 1], c=full_lab, cmap='tab10',
+                    s=15, alpha=0.6)
+        plt.scatter(Cf[:, 0], Cf[:, 1], c='red', marker='X',
+                    s=180, edgecolors='k', linewidths=1.5, label='centroids')
+        plt.legend(); plt.title('Cluster assignments')
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'kmeans_clusters.png'),
-                    dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(output_dir, 'kmeans_clusters.png'), dpi=120)
         plt.close()
 
-    print(f"Artifacts saved to {output_dir}")
+    print(f"[save_artifacts] wrote to {output_dir}/")
 
+
+# ── main ──────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("K-Means Clustering (From Scratch, k-means++ Init)")
-    print("=" * 60)
+    print("=" * 55)
+    print(" K-Means  |  from scratch, k-means++ init")
+    print("=" * 55)
+    set_seed()
+    meta = get_task_metadata()
+    k = meta['k']
+    print(f"task: {meta['task_name']}   k={k}\n")
 
-    set_seed(42)
-    metadata = get_task_metadata()
-    print(f"\nTask: {metadata['task_name']}")
-    print(f"Algorithm: {metadata['algorithm']}")
-    k = metadata['k']
-    print(f"Number of clusters: {k}")
+    Xtr, Xva, ytr, yva, X_np, y_all = make_dataloaders(n_samples=800, k=k)
+    print(f"data : {Xtr.shape[0]} train / {Xva.shape[0]} val")
 
-    # Data
-    print("\nGenerating 4-cluster blob dataset...")
-    X_train, X_val, y_train, y_val, X_np, y_true = make_dataloaders(
-        n_samples=800, n_features=2, k=k
-    )
-    print(f"Train samples: {X_train.shape[0]}, Val samples: {X_val.shape[0]}")
+    model = build_model(Xtr, k=k)
+    hist = train(model, Xtr, max_iters=100, tol=1e-6)
+    print(f"finished in {hist['n_iterations']} iterations\n")
 
-    # Build model (k-means++ init on training data)
-    print("\nInitializing centroids with k-means++...")
-    model = build_model(X_train, k=k)
-    print(f"Initial centroids shape: {model['centroids'].shape}")
+    tr_m = evaluate(model, Xtr, y_true=ytr)
+    va_m = evaluate(model, Xva, y_true=yva)
+    print(f"  train  inertia={tr_m['inertia']:.2f}  ARI={tr_m['adjusted_rand_index']:.4f}")
+    print(f"  val    inertia={va_m['inertia']:.2f}  ARI={va_m['adjusted_rand_index']:.4f}")
 
-    # Train (run k-means on training data)
-    print("\n" + "-" * 60)
-    history = train(model, X_train, max_iters=100, tol=1e-6)
-    print(f"Finished in {history['n_iterations']} iterations")
+    # sklearn baseline (full dataset)
+    sk = SkKMeans(n_clusters=k, init='k-means++', n_init=10, random_state=SEED).fit(X_np)
+    sk_ari = adjusted_rand_score(y_all, sk.labels_)
+    total_inertia = tr_m['inertia'] + va_m['inertia']
+    ratio = total_inertia / sk.inertia_ if sk.inertia_ > 0 else 999
+    print(f"  sklearn inertia={sk.inertia_:.2f}  ARI={sk_ari:.4f}")
+    print(f"  our/sklearn inertia ratio = {ratio:.4f}")
 
-    # Evaluate on training set
-    print("\n" + "-" * 60)
-    print("Evaluating on training set...")
-    train_metrics = evaluate(model, X_train, y_true=y_train)
-    print(f"Train Inertia: {train_metrics['inertia']:.4f}")
-    print(f"Train ARI:     {train_metrics['adjusted_rand_index']:.4f}")
+    save_artifacts(model, dict(
+        train_inertia=tr_m['inertia'], train_ari=tr_m['adjusted_rand_index'],
+        val_inertia=va_m['inertia'],   val_ari=va_m['adjusted_rand_index'],
+        sklearn_inertia=sk.inertia_,   sklearn_ari=sk_ari,
+        inertia_ratio=ratio, n_iterations=hist['n_iterations'],
+        inertia_history=hist['inertia_history'], X_2d=X_np))
 
-    # Evaluate on validation set
-    print("\nEvaluating on validation set...")
-    val_metrics = evaluate(model, X_val, y_true=y_val)
-    print(f"Val Inertia:   {val_metrics['inertia']:.4f}")
-    print(f"Val ARI:       {val_metrics['adjusted_rand_index']:.4f}")
+    print(f"\n{'='*55}")
+    print(" QUALITY CHECKS")
+    print(f"{'='*55}")
+    ok = True
+    for tag, cond in [
+        (f"inertia converged         "
+         f"({hist['inertia_history'][0]:.1f} -> {hist['inertia_history'][-1]:.1f})",
+         hist['inertia_history'][-1] <= hist['inertia_history'][0]),
+        (f"within 5 % of sklearn     (ratio={ratio:.4f})",  ratio < 1.05),
+        (f"val ARI > 0.8             ({va_m['adjusted_rand_index']:.4f})",
+         va_m['adjusted_rand_index'] > 0.8),
+        (f"converged < 100 iters     ({hist['n_iterations']})",
+         hist['n_iterations'] < 100),
+    ]:
+        print(f"  [{'PASS' if cond else 'FAIL'}] {tag}")
+        ok = ok and cond
 
-    # Compare with sklearn (on full dataset for fair comparison)
-    print("\nRunning sklearn KMeans for comparison...")
-    sklearn_km = SklearnKMeans(n_clusters=k, init='k-means++',
-                               n_init=10, random_state=42)
-    sklearn_km.fit(X_np)
-    sklearn_inertia = sklearn_km.inertia_
-    sklearn_ari = adjusted_rand_score(y_true, sklearn_km.labels_)
-    print(f"Sklearn Inertia: {sklearn_inertia:.4f}")
-    print(f"Sklearn ARI:     {sklearn_ari:.4f}")
-
-    # Inertia comparison (use train inertia for ratio)
-    total_inertia = train_metrics['inertia'] + val_metrics['inertia']
-    inertia_ratio = total_inertia / sklearn_inertia if sklearn_inertia > 0 else 999
-    print(f"\nInertia ratio (ours/sklearn): {inertia_ratio:.4f}")
-
-    # Save artifacts
-    print("\nSaving artifacts...")
-    all_metrics = {
-        'train_inertia': train_metrics['inertia'],
-        'train_ari': train_metrics['adjusted_rand_index'],
-        'val_inertia': val_metrics['inertia'],
-        'val_ari': val_metrics['adjusted_rand_index'],
-        'sklearn_inertia': sklearn_inertia,
-        'sklearn_ari': sklearn_ari,
-        'inertia_ratio': inertia_ratio,
-        'n_iterations': history['n_iterations'],
-        'inertia_history': history['inertia_history'],
-        'X_2d': X_np
-    }
-    save_artifacts(model, all_metrics)
-
-    # Final results
-    print("\n" + "=" * 60)
-    print("FINAL RESULTS")
-    print("=" * 60)
-    print(f"Train Inertia:    {train_metrics['inertia']:.4f}")
-    print(f"Train ARI:        {train_metrics['adjusted_rand_index']:.4f}")
-    print(f"Val Inertia:      {val_metrics['inertia']:.4f}")
-    print(f"Val ARI:          {val_metrics['adjusted_rand_index']:.4f}")
-    print(f"Sklearn Inertia:  {sklearn_inertia:.4f}")
-    print(f"Sklearn ARI:      {sklearn_ari:.4f}")
-    print(f"Inertia Ratio:    {inertia_ratio:.4f}")
-    print(f"Iterations:       {history['n_iterations']}")
-
-    # Quality checks
-    print("\n" + "=" * 60)
-    print("QUALITY CHECKS")
-    print("=" * 60)
-
-    checks_passed = True
-
-    # Check 1: Inertia non-increasing (converged or decreased)
-    inertia_ok = history['inertia_history'][-1] <= history['inertia_history'][0]
-    s1 = "PASS" if inertia_ok else "FAIL"
-    print(f"[{s1}] Inertia converged: "
-          f"{history['inertia_history'][0]:.2f} -> {history['inertia_history'][-1]:.2f}")
-    checks_passed = checks_passed and inertia_ok
-
-    # Check 2: Our inertia within 5% of sklearn
-    within_5pct = inertia_ratio < 1.05
-    s2 = "PASS" if within_5pct else "FAIL"
-    print(f"[{s2}] Inertia within 5% of sklearn: ratio = {inertia_ratio:.4f}")
-    checks_passed = checks_passed and within_5pct
-
-    # Check 3: Val ARI > 0.8 (good cluster recovery on validation)
-    ari_ok = val_metrics['adjusted_rand_index'] > 0.8
-    s3 = "PASS" if ari_ok else "FAIL"
-    print(f"[{s3}] Val ARI > 0.8: {val_metrics['adjusted_rand_index']:.4f}")
-    checks_passed = checks_passed and ari_ok
-
-    # Check 4: Converged within max iterations
-    converged = history['n_iterations'] < 100
-    s4 = "PASS" if converged else "FAIL"
-    print(f"[{s4}] Converged before max iters: {history['n_iterations']} iterations")
-    checks_passed = checks_passed and converged
-
-    print("\n" + "=" * 60)
-    if checks_passed:
-        print("PASS: All quality checks passed!")
-    else:
-        print("FAIL: Some quality checks failed!")
-    print("=" * 60)
-
-    sys.exit(0 if checks_passed else 1)
+    print(f"\n{'PASS' if ok else 'FAIL'}: all quality checks {'passed' if ok else 'did not pass'}")
+    sys.exit(0 if ok else 1)
