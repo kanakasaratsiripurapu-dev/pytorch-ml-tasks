@@ -203,12 +203,12 @@ if __name__ == '__main__':
     print(f"  train  inertia={tr_m['inertia']:.2f}  ARI={tr_m['adjusted_rand_index']:.4f}")
     print(f"  val    inertia={va_m['inertia']:.2f}  ARI={va_m['adjusted_rand_index']:.4f}")
 
-    # sklearn baseline (full dataset)
-    sk = SkKMeans(n_clusters=k, init='k-means++', n_init=10, random_state=SEED).fit(X_np)
-    sk_ari = adjusted_rand_score(y_all, sk.labels_)
-    total_inertia = tr_m['inertia'] + va_m['inertia']
-    ratio = total_inertia / sk.inertia_ if sk.inertia_ > 0 else 999
-    print(f"  sklearn inertia={sk.inertia_:.2f}  ARI={sk_ari:.4f}")
+    # sklearn baseline (training data only — fair comparison)
+    Xtr_np = Xtr.cpu().numpy()
+    sk = SkKMeans(n_clusters=k, init='k-means++', n_init=10, random_state=SEED).fit(Xtr_np)
+    sk_ari = adjusted_rand_score(ytr, sk.labels_)
+    ratio = tr_m['inertia'] / sk.inertia_ if sk.inertia_ > 0 else 999
+    print(f"  sklearn inertia={sk.inertia_:.2f}  ARI={sk_ari:.4f}  (train only)")
     print(f"  our/sklearn inertia ratio = {ratio:.4f}")
 
     save_artifacts(model, dict(
