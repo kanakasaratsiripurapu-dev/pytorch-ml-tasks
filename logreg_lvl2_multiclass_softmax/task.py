@@ -1,9 +1,12 @@
-"""
+r"""
 Multiclass Softmax Regression using torch.nn.Module + CrossEntropyLoss.
 
 Mathematical formulation:
-    Softmax: P(y=k|x) = exp(z_k) / sum_j exp(z_j)
-    Cross-Entropy Loss: L = -(1/N) sum_i sum_k y_{ik} log P(y=k|x_i)
+    Softmax:
+        $P(y=k \mid \mathbf{x}) = \frac{e^{z_k}}{\sum_{j=1}^{K} e^{z_j}}$
+
+    Cross-Entropy Loss:
+        $L = -\frac{1}{N} \sum_{i=1}^{N} \sum_{k=1}^{K} y_{ik} \log P(y=k \mid \mathbf{x}_i)$
 
 Uses Adam optimizer on 3-class synthetic blob data.
 Produces decision boundary contour plot.

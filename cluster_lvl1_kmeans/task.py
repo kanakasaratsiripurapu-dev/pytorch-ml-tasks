@@ -97,10 +97,11 @@ def _compute_inertia(X, centroids, labels):
     return ((X - assigned_centroids) ** 2).sum().item()
 
 
-def make_dataloaders(n_samples=800, n_features=2, k=4):
+def make_dataloaders(n_samples=800, n_features=2, k=4, val_ratio=0.2):
     """
     Generate synthetic blob data for clustering.
-    Returns raw tensors and ground-truth labels.
+    Split into 80% train / 20% validation.
+    Returns train/val tensors, ground-truth labels, and raw numpy arrays.
     """
     set_seed(42)
 
@@ -112,10 +113,19 @@ def make_dataloaders(n_samples=800, n_features=2, k=4):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    device = get_device()
-    X_tensor = torch.FloatTensor(X_scaled).to(device)
+    # Split into train/val
+    indices = np.random.permutation(n_samples)
+    val_size = int(n_samples * val_ratio)
+    train_idx = indices[val_size:]
+    val_idx = indices[:val_size]
 
-    return X_tensor, y_true, X_scaled
+    device = get_device()
+    X_train = torch.FloatTensor(X_scaled[train_idx]).to(device)
+    X_val = torch.FloatTensor(X_scaled[val_idx]).to(device)
+    y_train = y_true[train_idx]
+    y_val = y_true[val_idx]
+
+    return X_train, X_val, y_train, y_val, X_scaled, y_true
 
 
 def build_model(X, k=4):
@@ -235,10 +245,12 @@ def save_artifacts(model, metrics, output_dir='./output'):
         plt.close()
 
     # Cluster scatter plot (2D only)
-    if 'X_2d' in metrics and 'labels' in metrics:
+    if 'X_2d' in metrics:
         X_2d = metrics['X_2d']
-        labels = metrics['labels']
         centroids = model['centroids'].cpu().numpy()
+        # Assign all points to nearest centroid for plotting
+        X_full = torch.FloatTensor(X_2d).to(model['centroids'].device)
+        labels = _assign_clusters(X_full, model['centroids']).cpu().numpy()
 
         plt.figure(figsize=(10, 8))
         scatter = plt.scatter(X_2d[:, 0], X_2d[:, 1], c=labels,
@@ -273,27 +285,35 @@ if __name__ == '__main__':
 
     # Data
     print("\nGenerating 4-cluster blob dataset...")
-    X_tensor, y_true, X_np = make_dataloaders(n_samples=800, n_features=2, k=k)
-    print(f"Samples: {X_tensor.shape[0]}, Features: {X_tensor.shape[1]}")
+    X_train, X_val, y_train, y_val, X_np, y_true = make_dataloaders(
+        n_samples=800, n_features=2, k=k
+    )
+    print(f"Train samples: {X_train.shape[0]}, Val samples: {X_val.shape[0]}")
 
-    # Build model (k-means++ init)
+    # Build model (k-means++ init on training data)
     print("\nInitializing centroids with k-means++...")
-    model = build_model(X_tensor, k=k)
+    model = build_model(X_train, k=k)
     print(f"Initial centroids shape: {model['centroids'].shape}")
 
-    # Train (run k-means)
+    # Train (run k-means on training data)
     print("\n" + "-" * 60)
-    history = train(model, X_tensor, max_iters=100, tol=1e-6)
+    history = train(model, X_train, max_iters=100, tol=1e-6)
     print(f"Finished in {history['n_iterations']} iterations")
 
-    # Evaluate our implementation
+    # Evaluate on training set
     print("\n" + "-" * 60)
-    print("Evaluating our K-Means...")
-    our_metrics = evaluate(model, X_tensor, y_true=y_true)
-    print(f"Our Inertia: {our_metrics['inertia']:.4f}")
-    print(f"Our ARI:     {our_metrics['adjusted_rand_index']:.4f}")
+    print("Evaluating on training set...")
+    train_metrics = evaluate(model, X_train, y_true=y_train)
+    print(f"Train Inertia: {train_metrics['inertia']:.4f}")
+    print(f"Train ARI:     {train_metrics['adjusted_rand_index']:.4f}")
 
-    # Compare with sklearn
+    # Evaluate on validation set
+    print("\nEvaluating on validation set...")
+    val_metrics = evaluate(model, X_val, y_true=y_val)
+    print(f"Val Inertia:   {val_metrics['inertia']:.4f}")
+    print(f"Val ARI:       {val_metrics['adjusted_rand_index']:.4f}")
+
+    # Compare with sklearn (on full dataset for fair comparison)
     print("\nRunning sklearn KMeans for comparison...")
     sklearn_km = SklearnKMeans(n_clusters=k, init='k-means++',
                                n_init=10, random_state=42)
@@ -303,21 +323,23 @@ if __name__ == '__main__':
     print(f"Sklearn Inertia: {sklearn_inertia:.4f}")
     print(f"Sklearn ARI:     {sklearn_ari:.4f}")
 
-    # Inertia comparison
-    inertia_ratio = our_metrics['inertia'] / sklearn_inertia if sklearn_inertia > 0 else 999
+    # Inertia comparison (use train inertia for ratio)
+    total_inertia = train_metrics['inertia'] + val_metrics['inertia']
+    inertia_ratio = total_inertia / sklearn_inertia if sklearn_inertia > 0 else 999
     print(f"\nInertia ratio (ours/sklearn): {inertia_ratio:.4f}")
 
     # Save artifacts
     print("\nSaving artifacts...")
     all_metrics = {
-        'our_inertia': our_metrics['inertia'],
-        'our_ari': our_metrics['adjusted_rand_index'],
+        'train_inertia': train_metrics['inertia'],
+        'train_ari': train_metrics['adjusted_rand_index'],
+        'val_inertia': val_metrics['inertia'],
+        'val_ari': val_metrics['adjusted_rand_index'],
         'sklearn_inertia': sklearn_inertia,
         'sklearn_ari': sklearn_ari,
         'inertia_ratio': inertia_ratio,
         'n_iterations': history['n_iterations'],
         'inertia_history': history['inertia_history'],
-        'labels': our_metrics['labels'],
         'X_2d': X_np
     }
     save_artifacts(model, all_metrics)
@@ -326,11 +348,13 @@ if __name__ == '__main__':
     print("\n" + "=" * 60)
     print("FINAL RESULTS")
     print("=" * 60)
-    print(f"Our Inertia:      {our_metrics['inertia']:.4f}")
+    print(f"Train Inertia:    {train_metrics['inertia']:.4f}")
+    print(f"Train ARI:        {train_metrics['adjusted_rand_index']:.4f}")
+    print(f"Val Inertia:      {val_metrics['inertia']:.4f}")
+    print(f"Val ARI:          {val_metrics['adjusted_rand_index']:.4f}")
     print(f"Sklearn Inertia:  {sklearn_inertia:.4f}")
-    print(f"Inertia Ratio:    {inertia_ratio:.4f}")
-    print(f"Our ARI:          {our_metrics['adjusted_rand_index']:.4f}")
     print(f"Sklearn ARI:      {sklearn_ari:.4f}")
+    print(f"Inertia Ratio:    {inertia_ratio:.4f}")
     print(f"Iterations:       {history['n_iterations']}")
 
     # Quality checks
@@ -353,10 +377,10 @@ if __name__ == '__main__':
     print(f"[{s2}] Inertia within 5% of sklearn: ratio = {inertia_ratio:.4f}")
     checks_passed = checks_passed and within_5pct
 
-    # Check 3: ARI > 0.8 (good cluster recovery)
-    ari_ok = our_metrics['adjusted_rand_index'] > 0.8
+    # Check 3: Val ARI > 0.8 (good cluster recovery on validation)
+    ari_ok = val_metrics['adjusted_rand_index'] > 0.8
     s3 = "PASS" if ari_ok else "FAIL"
-    print(f"[{s3}] ARI > 0.8: {our_metrics['adjusted_rand_index']:.4f}")
+    print(f"[{s3}] Val ARI > 0.8: {val_metrics['adjusted_rand_index']:.4f}")
     checks_passed = checks_passed and ari_ok
 
     # Check 4: Converged within max iterations

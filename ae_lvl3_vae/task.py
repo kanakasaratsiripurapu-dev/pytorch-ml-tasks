@@ -1,14 +1,19 @@
-"""
+r"""
 Variational Autoencoder (VAE) with reparameterization trick on MNIST.
 
 Mathematical formulation:
-    ELBO = E_q(z|x)[ log p(x|z) ] - KL( q(z|x) || p(z) )
+    ELBO (Evidence Lower Bound):
+        $\mathcal{L}(\theta, \phi; \mathbf{x}) =
+         \mathbb{E}_{q_\phi(\mathbf{z}|\mathbf{x})}[\log p_\theta(\mathbf{x}|\mathbf{z})]
+         - D_{KL}(q_\phi(\mathbf{z}|\mathbf{x}) \| p(\mathbf{z}))$
 
     Reparameterization trick:
-        z = mu + sigma * eps,   eps ~ N(0, I)
+        $\mathbf{z} = \boldsymbol{\mu} + \boldsymbol{\sigma} \odot \boldsymbol{\epsilon},
+         \quad \boldsymbol{\epsilon} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$
 
-    KL divergence (closed form for two Gaussians):
-        KL(q||p) = -0.5 * sum_j( 1 + log(sigma_j^2) - mu_j^2 - sigma_j^2 )
+    KL divergence (closed form for diagonal Gaussian vs standard normal):
+        $D_{KL}(q \| p) = -\frac{1}{2} \sum_{j=1}^{J}
+         \left(1 + \log \sigma_j^2 - \mu_j^2 - \sigma_j^2\right)$
 
     Reconstruction loss: Binary Cross-Entropy per pixel.
 
